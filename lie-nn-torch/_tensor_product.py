@@ -1,3 +1,7 @@
+"""
+Adapted from e3nn tensor product by Mario Geiger
+"""
+
 from collections import OrderedDict
 from math import sqrt
 from typing import List, NamedTuple, Optional, Union, Dict, Tuple
