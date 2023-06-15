@@ -450,7 +450,6 @@ def codegen_tensor_product_left_right(
     output_shape = output_shape + (irreps_out_dim, )
     
     irreps_in1_dim = sum(irreps_in1[i].mul * irreps_in1[i].rep.dim for i in range(len(irreps_in1)))
-    print(irreps_in1_dim)
     irreps_in2_dim = sum(irreps_in2[i].mul * irreps_in2[i].rep.dim for i in range(len(irreps_in2)))
     x1s = x1s.reshape(-1, irreps_in1_dim)
     x2s = x2s.reshape(-1, irreps_in2_dim)
@@ -481,7 +480,6 @@ def codegen_tensor_product_left_right(
             i = mul_ir.mul * mul_ir.rep.dim
             x1_list.append(x1s[:, d : d + i].reshape(batch_numel, mul_ir.mul, mul_ir.rep.dim))
             d += i
-    print(x1_list[0].shape)
     x2_list = []
     # If only one input irrep, can avoid creating a view
     if len(irreps_in2) == 1:
@@ -493,7 +491,6 @@ def codegen_tensor_product_left_right(
             i = mul_ir.mul * mul_ir.rep.dim
             x2_list.append(x2s[:, d : d + i].reshape(batch_numel, mul_ir.mul,
                                              mul_ir.rep.dim))
-    print(x2_list[0].shape)
     # The einsum string index to prepend to the weights if the weights are not shared and have a batch dimension
     z = '' if shared_weights else 'z'
 
@@ -549,7 +546,6 @@ def codegen_tensor_product_left_right(
                                         tracer=tracer)
             cg_keys.append(key)
         cg = cg_dict_out[key]
-        print("cg", cg.shape)
         #Store the cg in constants.pt to not compute them
         #cg = fx.Proxy(graph.get_attr(cg_name), tracer=tracer)
 
@@ -631,11 +627,9 @@ def codegen_tensor_product_left_right(
     # Make GraphModules
     cg_mats = {}
     for i_1, i_2, i_3 in cg_keys:
-        print(i_1, i_2, i_3)
         cg_mats[f"_cg_{i_1}_{i_2}_{i_3}"] = torch.tensor(lie.clebsch_gordan(
             irreps_in1[i_1].rep, irreps_in2[i_2].rep, irreps_out[i_3].rep
         ), dtype=type).sum(0) # TODO: add weights for null space dimension
-        print(cg_mats[f"_cg_{i_1}_{i_2}_{i_3}"].shape)
     # Make GraphModules
     constants_root = torch.nn.Module()
     for key, value in cg_mats.items():
@@ -671,7 +665,6 @@ def codegen_tensor_product_left_right(
             torch.zeros((1 if shared_weights else batchdim, flat_weight_index),
                         dtype=type),
         )
-        print("example_inputs", example_inputs[0].shape, example_inputs[1].shape, example_inputs[2].shape)
         graphmod = optimize_einsums_full(graphmod, example_inputs)
     return graphmod
 

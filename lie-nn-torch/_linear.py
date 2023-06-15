@@ -1,10 +1,10 @@
 from ast import Tuple
 from typing import List, NamedTuple, Optional, Union
-from LieCG import so13
 
+import lie_nn as lie
 import torch
-from LieCG.so13.utils import CodeGenMixin, _sum_tensors, prod
 from opt_einsum_fx import optimize_einsums_full
+from .utils import CodeGenMixin, _sum_tensors, prod
 from torch import fx
 
 
@@ -19,8 +19,8 @@ class Linear(CodeGenMixin, torch.nn.Module):
 
     def __init__(
         self,
-        irreps_in: so13.Lorentz_Irreps,
-        irreps_out: so13.Lorentz_Irreps,
+        irreps_in: lie.Rep,
+        irreps_out: lie.Rep,
         *,
         internal_weights: Optional[bool] = None,
         shared_weights: Optional[bool] = None,
@@ -33,9 +33,6 @@ class Linear(CodeGenMixin, torch.nn.Module):
         super().__init__()
 
         assert path_normalization in ['element', 'path']
-
-        irreps_in = so13.Lorentz_Irreps(irreps_in)
-        irreps_out = so13.Lorentz_Irreps(irreps_out)
 
         if use_complex:
             self.type = torch.get_default_dtype()
@@ -198,8 +195,8 @@ class Linear(CodeGenMixin, torch.nn.Module):
 
 
 def _codegen_linear(
-    irreps_in: so13.Lorentz_Irreps,
-    irreps_out: so13.Lorentz_Irreps,
+    irreps_in: lie.Rep,
+    irreps_out: lie.Rep,
     instructions: List[Instruction],
     shared_weights: bool = False,
     optimize_einsums: bool = True,
