@@ -1,6 +1,6 @@
 # lie-nn-torch
 
-Create neural networks equivariant to reductive Lie groups in torch. This library implements to torch functions to use the group operations implemented in [lie-nn](https://github.com/lie-nn/lie-nn) on torch tensors data.
+Create neural networks equivariant to reductive Lie groups in Pytorch. This library implements the Pytorch functions to use all the group operations implemented in [lie-nn](https://github.com/lie-nn/lie-nn) on torch tensors data.
 
 # Functions
 
