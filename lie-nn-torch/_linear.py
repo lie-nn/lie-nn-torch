@@ -4,8 +4,9 @@ from typing import List, NamedTuple, Optional, Union
 import lie_nn as lie
 import torch
 from opt_einsum_fx import optimize_einsums_full
-from .utils import CodeGenMixin, _sum_tensors, prod
 from torch import fx
+
+from .utils import CodeGenMixin, _sum_tensors, prod
 
 
 class Instruction(NamedTuple):
@@ -32,6 +33,9 @@ class Linear(CodeGenMixin, torch.nn.Module):
     ) -> None:
         super().__init__()
 
+        irreps_in = irreps_in.irreps
+        irreps_out = irreps_out.irreps
+        
         assert path_normalization in ['element', 'path']
 
         if use_complex:
@@ -42,9 +46,9 @@ class Linear(CodeGenMixin, torch.nn.Module):
         if instructions is None:
             # By default, make all possible connections
             instructions = [(i_in, i_out)
-                            for i_in, (_, ir_in) in enumerate(irreps_in)
-                            for i_out, (_, ir_out) in enumerate(irreps_out)
-                            if ir_in == ir_out]
+                            for i_in, ir_in in enumerate(irreps_in)
+                            for i_out, ir_out in enumerate(irreps_out)
+                            if ir_in.rep == ir_out.rep]
 
         instructions = [
             Instruction(
@@ -76,23 +80,23 @@ class Linear(CodeGenMixin, torch.nn.Module):
                 raise IndexError(
                     f"{ins.i_out} is not a valid index for irreps_out")
             if not (ins.i_in == -1
-                    or irreps_in[ins.i_in].ir == irreps_out[ins.i_out].ir):
+                    or irreps_in[ins.i_in].rep == irreps_out[ins.i_out].rep):
                 raise ValueError(
                     f"{ins.i_in} and {ins.i_out} do not have the same irrep")
 
         if biases is None:
             biases = len(irreps_out) * (False, )
         if isinstance(biases, bool):
-            biases = [biases and ir.is_scalar() for _, ir in irreps_out]
+            biases = [biases and ir.rep.is_scalar() for ir in irreps_out]
 
         assert len(biases) == len(irreps_out)
-        assert all(ir.is_scalar() or (not b)
-                   for b, (_, ir) in zip(biases, irreps_out))
+        assert all(ir.rep.is_scalar() or (not b)
+                   for b, ir in zip(biases, irreps_out))
 
         instructions += [
             Instruction(i_in=-1,
                         i_out=i_out,
-                        path_shape=(mul_ir.dim, ),
+                        path_shape=(mul_ir.mul * mul_ir.rep.dim, ),
                         path_weight=1.0)
             for i_out, (bias, mul_ir) in enumerate(zip(biases, irreps_out))
             if bias
@@ -151,11 +155,12 @@ class Linear(CodeGenMixin, torch.nn.Module):
             self.register_buffer('bias', torch.Tensor())
 
         # == Compute output mask ==
-        if self.irreps_out.dim > 0:
+        irreps_out_dim = sum(mul_ir.mul * mul_ir.rep.dim for mul_ir in self.irreps_out)
+        if irreps_out_dim > 0:
             output_mask = torch.cat([
-                torch.ones(mul_ir.dim) if any(
+                torch.ones(mul_ir.mul * mul_ir.rep.dim) if any(
                     (ins.i_out == i_out) and (0 not in ins.path_shape)
-                    for ins in self.instructions) else torch.zeros(mul_ir.dim)
+                    for ins in self.instructions) else torch.zeros(mul_ir.mul * mul_ir.rep.dim)
                 for i_out, mul_ir in enumerate(self.irreps_out)
             ])
         else:
@@ -163,7 +168,9 @@ class Linear(CodeGenMixin, torch.nn.Module):
         self.register_buffer('output_mask', output_mask)
 
     def __repr__(self):
-        return f"{self.__class__.__name__}({self.irreps_in} -> {self.irreps_out} | {self.weight_numel} weights)"
+        irreps_in = lie.ReducedRep.from_irreps(self.irreps_in)
+        irreps_out = lie.ReducedRep.from_irreps(self.irreps_out)
+        return f"{self.__class__.__name__}({irreps_in} -> {irreps_out} | {self.weight_numel} weights)"
 
     def forward(self,
                 features,
@@ -211,7 +218,8 @@ def _codegen_linear(
     bs = fx.Proxy(graph_out.placeholder('b', torch.Tensor), tracer_out)
 
     size = x.shape[:-1]
-    outsize = size + (irreps_out.dim, )
+    irreps_out_dim = sum(ir.mul * ir.rep.dim for ir in irreps_out)
+    outsize = size + (irreps_out_dim, )
 
     bias_numel = sum(irreps_out[i.i_out].dim for i in instructions
                      if i.i_in == -1)
@@ -230,7 +238,8 @@ def _codegen_linear(
         # 0 is weight_numel
         return fx.GraphModule({}, graph_out, "linear_forward"), 0, 0
 
-    x = x.reshape(-1, irreps_in.dim)
+    irreps_in_dim = sum(ir.mul * ir.rep.dim for ir in irreps_in)
+    x = x.reshape(-1, irreps_in_dim)
     batch_out = x.shape[0]
 
     weight_numel = sum(
@@ -244,12 +253,15 @@ def _codegen_linear(
             x.reshape(batch_out, *(()), irreps_in[0].mul, irreps_in[0].ir.dim)
         ]
     else:
-        x_list = [
-            x.narrow(-1, i.start,
-                     mul_ir.dim).reshape(batch_out, *(()), mul_ir.mul,
-                                         mul_ir.ir.dim)
-            for i, mul_ir in zip(irreps_in.slices(), irreps_in)
-        ]
+        x_list = []
+        d = 0
+        for mul_ir in irreps_in:
+            x_list.append(
+                x.narrow(-1, d,
+                        mul_ir.mul * mul_ir.rep.dim).reshape(batch_out, *(()), mul_ir.mul,
+                                            mul_ir.rep.dim)
+            )
+            d += mul_ir.mul * mul_ir.rep.dim
 
     z = '' if shared_weights else 'z'
 
@@ -257,6 +269,7 @@ def _codegen_linear(
     flat_bias_index = 0
 
     out_list = []
+    print(instructions)
 
     for ins in instructions:
         mul_ir_out = irreps_out[ins.i_out]
@@ -323,8 +336,9 @@ def _codegen_linear(
             type = torch.get_default_dtype()
         else:
             type = torch.get_default_dtype()
+        irreps_in_dim = sum(ir.mul * ir.rep.dim for ir in irreps_in)
         example_inputs = (
-            torch.zeros((batchdim, *(()), irreps_in.dim), dtype=type),
+            torch.zeros((batchdim, *(()), irreps_in_dim), dtype=type),
             torch.zeros(
                 (1 if shared_weights else batchdim, 1, 1, weight_numel),
                 dtype=type,
@@ -335,19 +349,3 @@ def _codegen_linear(
         graphmod_out = optimize_einsums_full(graphmod_out, example_inputs)
 
     return graphmod_out, weight_numel, bias_numel
-
-
-"""MIT License
-
-Euclidean neural networks (e3nn) Copyright (c) 2020, The Regents of the
-University of California, through Lawrence Berkeley National Laboratory
-(subject to receipt of any required approvals from the U.S. Dept. of Energy), 
-Ecole Polytechnique Federale de Lausanne (EPFL), Free University of Berlin 
-and Kostiantyn Lapchevskyi. All rights reserved.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy 
-of this software and associated documentation files (the "Software"), to deal 
-in the Software without restriction, including without limitation the rights to use,
-copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the 
-Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:"""

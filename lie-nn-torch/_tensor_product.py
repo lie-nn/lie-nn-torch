@@ -476,7 +476,7 @@ def codegen_tensor_product_left_right(
     else:
         x1_list = []
         d = 0
-        for i, mul_ir in enumerate(irreps_in1):
+        for _, mul_ir in enumerate(irreps_in1):
             i = mul_ir.mul * mul_ir.rep.dim
             x1_list.append(x1s[:, d : d + i].reshape(batch_numel, mul_ir.mul, mul_ir.rep.dim))
             d += i
@@ -487,7 +487,7 @@ def codegen_tensor_product_left_right(
             x2s.reshape(batch_numel, irreps_in2[0].mul, irreps_in2[0].rep.dim))
     else:
         d=0
-        for i, mul_ir in enumerate(irreps_in2):
+        for _, mul_ir in enumerate(irreps_in2):
             i = mul_ir.mul * mul_ir.rep.dim
             x2_list.append(x2s[:, d : d + i].reshape(batch_numel, mul_ir.mul,
                                              mul_ir.rep.dim))
