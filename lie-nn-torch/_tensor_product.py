@@ -1,15 +1,14 @@
 from collections import OrderedDict
 from math import sqrt
 from typing import List, NamedTuple, Optional, Union, Dict, Tuple
-from LieCG import so13
-from LieCG.CG_coefficients.CG_lorentz import CGDict, clebschmat
-from LieCG.so13.utils import CodeGenMixin, _sum_tensors, prod
+import lie_nn as lie
 
 import torch
 import torch.fx
 from opt_einsum_fx import optimize_einsums_full
 
 from torch import fx
+from .utils import CodeGenMixin, _sum_tensors, prod
 
 
 class Instruction(NamedTuple):
@@ -21,14 +20,44 @@ class Instruction(NamedTuple):
     path_weight: float
     path_shape: tuple
 
+def tp_out_irreps_with_instructions(
+    irreps1: lie.Rep, irreps2: lie.Rep, target_reps: lie.Rep
+) -> Tuple[lie.Rep, List]:
+    trainable = True
+
+    # Collect possible irreps and their instructions
+    irreps_out_list: List[Tuple[int, lie.Rep]] = []
+    instructions = []
+    target_irreps = [mulrep.rep for mulrep in target_reps]
+    for i, irrep1 in enumerate(irreps1):
+        mul, ir_in = irrep1.mul, irrep1.rep
+        for j, irrep2 in enumerate(irreps2):
+            ir_edge = irrep2.rep
+            for ir_out in ir_in * ir_edge:  # | l1 - l2 | <= l <= l1 + l2
+                if ir_out in target_irreps:
+                    k = len(irreps_out_list)  # instruction index
+                    irreps_out_list.append((mul, ir_out))
+                    instructions.append((i, j, k, "uvu", trainable))
+
+    # We sort the output irreps of the tensor product so that we can simplify them
+    # when they are provided to the second o3.Linear
+    irreps_out = [lie.MulIrrep(mul, irreps_out) for mul, irreps_out in irreps_out_list]
+    irreps_out = lie.ReducedRep.from_irreps(irreps_out)
+    # Permute the output indexes of the instructions to match the sorted irreps:
+    instructions = [
+        (i_in1, i_in2, i_out, mode, train)
+        for i_in1, i_in2, i_out, mode, train in instructions
+    ]
+
+    return irreps_out, instructions
 
 class TensorProduct(CodeGenMixin, torch.nn.Module):
 
     def __init__(
         self,
-        irreps_in1: so13.Lorentz_Irreps,
-        irreps_in2: so13.Lorentz_Irreps,
-        irreps_out: so13.Lorentz_Irreps,
+        irreps_in1: lie.Rep,
+        irreps_in2: lie.Rep,
+        irreps_out: lie.Rep,
         instructions: List[Tuple],
         in1_var: Optional[Union[List[float], torch.Tensor]] = None,
         in2_var: Optional[Union[List[float], torch.Tensor]] = None,
@@ -57,9 +86,9 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
         assert irrep_normalization in ['component', 'norm', 'none']
         assert path_normalization in ['element', 'path', 'none']
 
-        self.irreps_in1 = so13.Lorentz_Irreps(irreps_in1)
-        self.irreps_in2 = so13.Lorentz_Irreps(irreps_in2)
-        self.irreps_out = so13.Lorentz_Irreps(irreps_out)
+        self.irreps_in1 = irreps_in1
+        self.irreps_in2 = irreps_in2
+        self.irreps_out = irreps_out
 
         del irreps_in1, irreps_in2, irreps_out
 
@@ -147,20 +176,14 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
             mul_ir_in1 = self.irreps_in1[ins.i_in1]
             mul_ir_in2 = self.irreps_in2[ins.i_in2]
             mul_ir_out = self.irreps_out[ins.i_out]
-            assert abs(
-                mul_ir_in1.ir.l - mul_ir_in2.ir.l
-            ) <= mul_ir_out.ir.l <= mul_ir_in1.ir.l + mul_ir_in2.ir.l
-            assert abs(
-                mul_ir_in1.ir.k - mul_ir_in2.ir.k
-            ) <= mul_ir_out.ir.k <= mul_ir_in1.ir.k + mul_ir_in2.ir.k
             assert ins.connection_mode in [
                 'uvw', 'uvu', 'uvv', 'uuw', 'uuu', 'uvuv', 'uvu<v', 'u<vw'
             ]
 
             if irrep_normalization == 'component':
-                alpha = mul_ir_out.ir.dim
+                alpha = mul_ir_out.rep.dim
             if irrep_normalization == 'norm':
-                alpha = mul_ir_in1.ir.dim * mul_ir_in2.ir.dim
+                alpha = mul_ir_in1.rep.dim * mul_ir_in2.rep.dim
             if irrep_normalization == 'none':
                 alpha = 1
 
@@ -187,8 +210,8 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
             for ins, alpha in zip(instructions, normalization_coefficients)
         ]
 
-        self._in1_dim = self.irreps_in1.dim
-        self._in2_dim = self.irreps_in2.dim
+        self._in1_dim = sum(self.irreps_in1[i].mul * self.irreps_in1[i].rep.dim for i in range(len(self.irreps_in1)))
+        self._in2_dim = sum(self.irreps_in2[i].mul * self.irreps_in2[i].rep.dim for i in range(len(self.irreps_in2)))
 
         if shared_weights is False and internal_weights is None:
             internal_weights = False
@@ -262,14 +285,16 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
             # For TorchScript, there always has to be some kind of defined .weight
             self.register_buffer('weight', torch.Tensor().to(self.type))
 
-        if self.irreps_out.dim > 0:
+        irreps_out_dim = sum(
+            ir.mul * ir.rep.dim for ir in self.irreps_out) if len(self.irreps_out) > 0 else 0
+        if irreps_out_dim > 0:
             output_mask = torch.cat([
-                torch.ones(mul * ir.dim) if any(
+                torch.ones(ir.mul * ir.rep.dim) if any(
                     (ins.i_out == i_out) and (ins.path_weight != 0) and (
                         0 not in ins.path_shape)
-                    for ins in self.instructions) else torch.zeros(mul *
-                                                                   ir.dim)
-                for i_out, (mul, ir) in enumerate(self.irreps_out)
+                    for ins in self.instructions) else torch.zeros(ir.mul *
+                                                                   ir.rep.dim)
+                for i_out, ir in enumerate(self.irreps_out)
             ])
         else:
             output_mask = torch.ones(0)
@@ -285,10 +310,13 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
 
     def __repr__(self):
         npath = sum(prod(i.path_shape) for i in self.instructions)
+        irreps_in1 = lie.ReducedRep.from_irreps(self.irreps_in1)
+        irreps_in2 = lie.ReducedRep.from_irreps(self.irreps_in2)
+        irreps_out = lie.ReducedRep.from_irreps(self.irreps_out)
         return (
             f"{self.__class__.__name__}"
-            f"({self.irreps_in1.simplify()} x {self.irreps_in2.simplify()} "
-            f"-> {self.irreps_out.simplify()} | {npath} paths | {self.weight_numel} weights)"
+            f"({irreps_in1} ⊗ {irreps_in2} "
+            f"-> {irreps_out} | {npath} paths | {self.weight_numel} weights)"
         )
 
     @torch.jit.unused
@@ -362,9 +390,9 @@ class TensorProduct(CodeGenMixin, torch.nn.Module):
 
 
 def codegen_tensor_product_left_right(
-    irreps_in1: so13.Lorentz_Irreps,
-    irreps_in2: so13.Lorentz_Irreps,
-    irreps_out: so13.Lorentz_Irreps,
+    irreps_in1: lie.Rep,
+    irreps_in2: lie.Rep,
+    irreps_out: lie.Rep,
     instructions: List[Instruction],
     shared_weights: bool = False,
     specialized_code: bool = True,
@@ -414,11 +442,14 @@ def codegen_tensor_product_left_right(
         x1s, x2s, weights = x1s.broadcast_to(
             output_shape + (-1, )), x2s.broadcast_to(output_shape + (
                 -1, )), weights.broadcast_to(output_shape + (-1, ))
-
-    output_shape = output_shape + (irreps_out.dim, )
-
-    x1s = x1s.reshape(-1, irreps_in1.dim)
-    x2s = x2s.reshape(-1, irreps_in2.dim)
+    irreps_out_dim = sum(irreps_out[i].mul * irreps_out[i].rep.dim for i in range(len(irreps_out)))
+    output_shape = output_shape + (irreps_out_dim, )
+    
+    irreps_in1_dim = sum(irreps_in1[i].mul * irreps_in1[i].rep.dim for i in range(len(irreps_in1)))
+    print(irreps_in1_dim)
+    irreps_in2_dim = sum(irreps_in2[i].mul * irreps_in2[i].rep.dim for i in range(len(irreps_in2)))
+    x1s = x1s.reshape(-1, irreps_in1_dim)
+    x2s = x2s.reshape(-1, irreps_in2_dim)
 
     batch_numel = x1s.shape[0]
 
@@ -437,24 +468,28 @@ def codegen_tensor_product_left_right(
     # If only one input irrep, can avoid creating a view
     if len(irreps_in1) == 1:
         x1_list = [
-            x1s.reshape(batch_numel, irreps_in1[0].mul, irreps_in1[0].ir.dim)
+            x1s.reshape(batch_numel, irreps_in1[0].mul, irreps_in1[0].rep.dim)
         ]
     else:
-        x1_list = [
-            x1s[:, i].reshape(batch_numel, mul_ir.mul, mul_ir.ir.dim)
-            for i, mul_ir in zip(irreps_in1.slices(), irreps_in1)
-        ]
-
+        x1_list = []
+        d = 0
+        for i, mul_ir in enumerate(irreps_in1):
+            i = mul_ir.mul * mul_ir.rep.dim
+            x1_list.append(x1s[:, d : d + i].reshape(batch_numel, mul_ir.mul, mul_ir.rep.dim))
+            d += i
+    print(x1_list[0].shape)
     x2_list = []
     # If only one input irrep, can avoid creating a view
     if len(irreps_in2) == 1:
         x2_list.append(
-            x2s.reshape(batch_numel, irreps_in2[0].mul, irreps_in2[0].ir.dim))
+            x2s.reshape(batch_numel, irreps_in2[0].mul, irreps_in2[0].rep.dim))
     else:
-        for i, mul_ir in zip(irreps_in2.slices(), irreps_in2):
-            x2_list.append(x2s[:, i].reshape(batch_numel, mul_ir.mul,
-                                             mul_ir.ir.dim))
-
+        d=0
+        for i, mul_ir in enumerate(irreps_in2):
+            i = mul_ir.mul * mul_ir.rep.dim
+            x2_list.append(x2s[:, d : d + i].reshape(batch_numel, mul_ir.mul,
+                                             mul_ir.rep.dim))
+    print(x2_list[0].shape)
     # The einsum string index to prepend to the weights if the weights are not shared and have a batch dimension
     z = '' if shared_weights else 'z'
 
@@ -470,11 +505,6 @@ def codegen_tensor_product_left_right(
         mul_ir_in1 = irreps_in1[ins.i_in1]
         mul_ir_in2 = irreps_in2[ins.i_in2]
         mul_ir_out = irreps_out[ins.i_out]
-
-        assert abs(mul_ir_in1.ir.l - mul_ir_in2.ir.l
-                   ) <= mul_ir_out.ir.l <= mul_ir_in1.ir.l + mul_ir_in2.ir.l
-        assert abs(mul_ir_in1.ir.k - mul_ir_in2.ir.k
-                   ) <= mul_ir_out.ir.k <= mul_ir_in1.ir.k + mul_ir_in2.ir.k
 
         if mul_ir_in1.dim == 0 or mul_ir_in2.dim == 0 or mul_ir_out.dim == 0:
             continue
@@ -507,137 +537,34 @@ def codegen_tensor_product_left_right(
 
         # Create a proxy & request for the relevant wigner cg
         # If not used (because of specialized code), will get removed later.
-        key = ((mul_ir_in1.ir.l, mul_ir_in1.ir.k),
-               (mul_ir_in2.ir.l, mul_ir_in2.ir.k), (mul_ir_out.ir.l,
-                                                    mul_ir_out.ir.k))
+        key = (ins.i_in1, ins.i_in2, ins.i_out)
         if key not in cg_keys:
             cg_dict_out[key] = fx.Proxy(graph.get_attr(
-                f"_cg_{key[0][0],key[0][1]}_{key[1][0],key[1][1]}_{key[2][0],key[2][1]}"
+                f"_cg_{key[0]}_{key[1]}_{key[2]}"
             ),
                                         tracer=tracer)
             cg_keys.append(key)
         cg = cg_dict_out[key]
-
+        print("cg", cg.shape)
         #Store the cg in constants.pt to not compute them
         #cg = fx.Proxy(graph.get_attr(cg_name), tracer=tracer)
 
-        l1k1l2k2l3k3 = ((mul_ir_in1.ir.l, mul_ir_in1.ir.k),
-                        (mul_ir_in2.ir.l, mul_ir_in2.ir.k), (mul_ir_out.ir.l,
-                                                             mul_ir_out.ir.k))
         if ins.connection_mode == 'uvw':
             assert ins.has_weight
-            if specialized_code and l1k1l2k2l3k3 == ((0, 0), (0, 0), (0, 0)):
-                result = torch.einsum(f"{z}uvw,zu,zv->zw", w,
-                                      x1.reshape(batch_numel, mul_ir_in1.dim),
-                                      x2.reshape(batch_numel, mul_ir_in2.dim))
-            elif specialized_code and mul_ir_in1.ir.l == 0 and mul_ir_in1.ir.k == 0:
-                result = torch.einsum(f"{z}uvw,zu,zvj->zwj", w,
-                                      x1.reshape(batch_numel, mul_ir_in1.dim),
-                                      x2) / sqrt(mul_ir_out.ir.dim)
-            elif specialized_code and mul_ir_in2.ir.l == 0 and mul_ir_in2.ir.k == 0:
-                result = torch.einsum(f"{z}uvw,zui,zv->zwi", w, x1,
-                                      x2.reshape(batch_numel,
-                                                 mul_ir_in2.dim)) / sqrt(
-                                                     mul_ir_out.ir.dim)
-            elif specialized_code and mul_ir_out.ir.l == 0 and mul_ir_out.ir.k == 0:
-                result = torch.einsum(f"{z}uvw,zui,zvi->zw", w, x1, x2) / sqrt(
-                    mul_ir_in1.ir.dim)
-            else:
-                result = torch.einsum(f"{z}uvw,ijk,zuvij->zwk", w, cg, xx)
+            result = torch.einsum(f"{z}uvw,ijk,zuvij->zwk", w, cg, xx)
         if ins.connection_mode == 'uvu':
             assert mul_ir_in1.mul == mul_ir_out.mul
-            if ins.has_weight:
-                if specialized_code and l1k1l2k2l3k3 == ((0, 0), (0, 0),
-                                                         (0, 0)):
-                    result = torch.einsum(
-                        f"{z}uv,zu,zv->zu", w,
-                        x1.reshape(batch_numel, mul_ir_in1.dim),
-                        x2.reshape(batch_numel, mul_ir_in2.dim))
-                elif specialized_code and mul_ir_in1.ir.l == 0 and mul_ir_in1.ir.k == 0:
-                    result = torch.einsum(
-                        f"{z}uv,zu,zvj->zuj", w,
-                        x1.reshape(batch_numel, mul_ir_in1.dim), x2) / sqrt(
-                            mul_ir_out.ir.dim)
-                elif specialized_code and mul_ir_in2.ir.l == 0 and mul_ir_in2.ir.k == 0:
-                    result = torch.einsum(
-                        f"{z}uv,zui,zv->zui", w, x1,
-                        x2.reshape(batch_numel, mul_ir_in2.dim)) / sqrt(
-                            mul_ir_out.ir.dim)
-                else:
-                    result = torch.einsum(f"{z}uv,ijk,zuvij->zuk", w, cg, xx)
-            else:
-                # not so useful operation because v is summed
-                result = torch.einsum("ijk,zuvij->zuk", cg, xx)
+            result = torch.einsum("ijk,zuvij->zuk", cg, xx)
         if ins.connection_mode == 'uvv':
             assert mul_ir_in2.mul == mul_ir_out.mul
             if ins.has_weight:
-                if specialized_code and l1k1l2k2l3k3 == ((0, 0), (0, 0),
-                                                         (0, 0)):
-                    result = torch.einsum(
-                        f"{z}uv,zu,zv->zv", w,
-                        x1.reshape(batch_numel, mul_ir_in1.dim),
-                        x2.reshape(batch_numel, mul_ir_in2.dim))
-                elif specialized_code and mul_ir_in1.ir.l == 0 and mul_ir_in1.ir.k == 0:
-                    result = torch.einsum(
-                        f"{z}uv,zu,zvj->zvj", w,
-                        x1.reshape(batch_numel, mul_ir_in1.dim), x2) / sqrt(
-                            mul_ir_out.ir.dim)
-                elif specialized_code and mul_ir_in2.ir.l == 0 and mul_ir_in2.ir.k == 0:
-                    result = torch.einsum(
-                        f"{z}uv,zui,zv->zvi", w, x1,
-                        x2.reshape(batch_numel, mul_ir_in2.dim)) / sqrt(
-                            mul_ir_out.ir.dim)
-                elif specialized_code and mul_ir_out.ir.l == 0 and mul_ir_out.ir.k == 0:
-                    result = torch.einsum(f"{z}uv,zui,zvi->zv", w, x1,
-                                          x2) / sqrt(mul_ir_in1.ir.dim)
-                else:
-                    result = torch.einsum(f"{z}uv,ijk,zuvij->zvk", w, cg, xx)
+                result = torch.einsum(f"{z}uv,ijk,zuvij->zvk", w, cg, xx)
             else:
-                # not so useful operation because u is summed
-                # only specialize out for this path
-                if specialized_code and l1k1l2k2l3k3 == ((0, 0), (0, 0),
-                                                         (0, 0)):
-                    result = torch.einsum(
-                        "zu,zv->zv", x1.reshape(batch_numel, mul_ir_in1.dim),
-                        x2.reshape(batch_numel, mul_ir_in2.dim))
-                elif specialized_code and mul_ir_in1.ir.l == 0 and mul_ir_in1.ir.k == 0:
-                    result = torch.einsum(
-                        "zu,zvj->zvj", x1.reshape(batch_numel, mul_ir_in1.dim),
-                        x2) / sqrt(mul_ir_out.ir.dim)
-                elif specialized_code and mul_ir_in2.ir.l == 0 and mul_ir_in2.ir.k == 0:
-                    result = torch.einsum(
-                        "zui,zv->zvi", x1,
-                        x2.reshape(batch_numel, mul_ir_in2.dim)) / sqrt(
-                            mul_ir_out.ir.dim)
-                elif specialized_code and mul_ir_out.ir.l == 0 and mul_ir_out.ir.k == 0:
-                    result = torch.einsum("zui,zvi->zv", x1, x2) / sqrt(
-                        mul_ir_in1.ir.dim)
-                else:
-                    result = torch.einsum("ijk,zuvij->zvk", cg, xx)
+                result = torch.einsum("ijk,zuvij->zvk", cg, xx)
         if ins.connection_mode == 'uuw':
             assert mul_ir_in1.mul == mul_ir_in2.mul
             if ins.has_weight:
-                if specialized_code and l1k1l2k2l3k3 == ((0, 0), (0, 0),
-                                                         (0, 0)):
-                    result = torch.einsum(
-                        f"{z}uw,zu,zu->zw", w,
-                        x1.reshape(batch_numel, mul_ir_in1.dim),
-                        x2.reshape(batch_numel, mul_ir_in2.dim))
-                elif specialized_code and mul_ir_in1.ir.l == 0 and mul_ir_in1.ir.k == 0:
-                    result = torch.einsum(
-                        f"{z}uw,zu,zuj->zwj", w,
-                        x1.reshape(batch_numel, mul_ir_in1.dim), x2) / sqrt(
-                            mul_ir_out.ir.dim)
-                elif specialized_code and mul_ir_in2.ir.l == 0 and mul_ir_in2.ir.k == 0:
-                    result = torch.einsum(
-                        f"{z}uw,zui,zu->zwi", w, x1,
-                        x2.reshape(batch_numel, mul_ir_in2.dim)) / sqrt(
-                            mul_ir_out.ir.dim)
-                elif specialized_code and mul_ir_out.ir.l == 0 and mul_ir_out.ir.k == 0:
-                    result = torch.einsum(f"{z}uw,zui,zui->zw", w, x1,
-                                          x2) / sqrt(mul_ir_in1.ir.dim)
-                else:
-                    result = torch.einsum(f"{z}uw,ijk,zuij->zwk", w, cg, xx)
+                result = torch.einsum(f"{z}uw,ijk,zuij->zwk", w, cg, xx)
             else:
                 # equivalent to tp(x, y, 'uuu').sum('u')
                 assert mul_ir_out.mul == 1
@@ -645,47 +572,9 @@ def codegen_tensor_product_left_right(
         if ins.connection_mode == 'uuu':
             assert mul_ir_in1.mul == mul_ir_in2.mul == mul_ir_out.mul
             if ins.has_weight:
-                if specialized_code and l1k1l2k2l3k3 == ((0, 0), (0, 0),
-                                                         (0, 0)):
-                    result = torch.einsum(
-                        f"{z}u,zu,zu->zu", w,
-                        x1.reshape(batch_numel, mul_ir_in1.dim),
-                        x2.reshape(batch_numel, mul_ir_in2.dim))
-                elif specialized_code and mul_ir_in1.ir.l == 0 and mul_ir_in1.ir.k == 0:
-                    result = torch.einsum(
-                        f"{z}u,zu,zuj->zuj", w,
-                        x1.reshape(batch_numel, mul_ir_in1.dim), x2) / sqrt(
-                            mul_ir_out.ir.dim)
-                elif specialized_code and mul_ir_in2.ir.l == 0 and mul_ir_in2.ir.k == 0:
-                    result = torch.einsum(
-                        f"{z}u,zui,zu->zui", w, x1,
-                        x2.reshape(batch_numel, mul_ir_in2.dim)) / sqrt(
-                            mul_ir_out.ir.dim)
-                elif specialized_code and mul_ir_out.ir.l == 0 and mul_ir_out.ir.k == 0:
-                    result = torch.einsum(f"{z}u,zui,zui->zu", w, x1,
-                                          x2) / sqrt(mul_ir_in1.ir.dim)
-                else:
-                    result = torch.einsum(f"{z}u,ijk,zuij->zuk", w, cg, xx)
+                result = torch.einsum(f"{z}u,ijk,zuij->zuk", w, cg, xx)
             else:
-                if specialized_code and l1k1l2k2l3k3 == ((0, 0), (0, 0),
-                                                         (0, 0)):
-                    result = torch.einsum(
-                        "zu,zu->zu", x1.reshape(batch_numel, mul_ir_in1.dim),
-                        x2.reshape(batch_numel, mul_ir_in2.dim))
-                elif specialized_code and mul_ir_in1.ir.l == 0 and mul_ir_in1.ir.k == 0:
-                    result = torch.einsum(
-                        "zu,zuj->zuj", x1.reshape(batch_numel, mul_ir_in1.dim),
-                        x2) / sqrt(mul_ir_out.ir.dim)
-                elif specialized_code and mul_ir_in2.ir.l == 0 and mul_ir_in2.ir.k == 0:
-                    result = torch.einsum(
-                        "zui,zu->zui", x1,
-                        x2.reshape(batch_numel, mul_ir_in2.dim)) / sqrt(
-                            mul_ir_out.ir.dim)
-                elif specialized_code and mul_ir_out.ir.l == 0 and mul_ir_out.ir.k == 0:
-                    result = torch.einsum("zui,zui->zu", x1, x2) / sqrt(
-                        mul_ir_in1.ir.dim)
-                else:
-                    result = torch.einsum("ijk,zuij->zuk", cg, xx)
+                result = torch.einsum("ijk,zuij->zuk", cg, xx)
         if ins.connection_mode == 'uvuv':
             assert mul_ir_in1.mul * mul_ir_in2.mul == mul_ir_out.mul
             if ins.has_weight:
@@ -737,9 +626,12 @@ def codegen_tensor_product_left_right(
         type = torch.get_default_dtype()
     # Make GraphModules
     cg_mats = {}
-    for (l_1, k_1), (l_2, k_2), (l_out, k_out) in cg_keys:
-        cg_mats[f"_cg_{l_1,k_1}_{l_2,k_2}_{l_out,k_out}"] = clebschmat(
-            (l_1, k_1), (l_2, k_2), (l_out, k_out)).to(type)
+    for i_1, i_2, i_3 in cg_keys:
+        print(i_1, i_2, i_3)
+        cg_mats[f"_cg_{i_1}_{i_2}_{i_3}"] = torch.tensor(lie.clebsch_gordan(
+            irreps_in1[i_1].rep, irreps_in2[i_2].rep, irreps_out[i_3].rep
+        ), dtype=type).sum(0) # TODO: add weights for null space dimension
+        print(cg_mats[f"_cg_{i_1}_{i_2}_{i_3}"].shape)
     # Make GraphModules
     constants_root = torch.nn.Module()
     for key, value in cg_mats.items():
@@ -767,126 +659,15 @@ def codegen_tensor_product_left_right(
         #
         # We use float32 and zeros to save memory and time, since opt_einsum_fx looks only at traced shapes, not values or dtypes.
         batchdim = 4
+        irreps_in1_dim = sum(irreps_in1[i].mul * irreps_in1[i].rep.dim for i in range(len(irreps_in1)))
+        irreps_in2_dim = sum(irreps_in2[i].mul * irreps_in2[i].rep.dim for i in range(len(irreps_in2)))
         example_inputs = (
-            torch.zeros((batchdim, irreps_in1.dim), dtype=type),
-            torch.zeros((batchdim, irreps_in2.dim), dtype=type),
+            torch.zeros((batchdim, irreps_in1_dim), dtype=type),
+            torch.zeros((batchdim, irreps_in2_dim), dtype=type),
             torch.zeros((1 if shared_weights else batchdim, flat_weight_index),
                         dtype=type),
         )
+        print("example_inputs", example_inputs[0].shape, example_inputs[1].shape, example_inputs[2].shape)
         graphmod = optimize_einsums_full(graphmod, example_inputs)
     return graphmod
 
-
-class FullyConnectedTensorProduct(TensorProduct):
-    r"""Fully-connected weighted tensor product
-    All the possible path allowed by :math:`|l_1 - l_2| \leq l_{out} \leq l_1 + l_2` 
-                                     :math:`|k_1 - k_2| \leq l_{out} \leq k_1 + k_2`are made.
-    The output is a sum on different paths:
-    .. math::
-        z_w = \sum_{u,v} w_{uvw} x_u \otimes y_v + \cdots \text{other paths}
-    where :math:`u,v,w` are the indices of the multiplicities.
-    Parameters
-    ----------
-    irreps_in1 : `so13.Lorentz_Irreps`
-        representation of the first input
-    irreps_in2 : `so13.Lorentz_Irreps`
-        representation of the second input
-    irreps_out : `so13.Lorentz_Irreps`
-        representation of the output
-    irrep_normalization : {'component', 'norm'}
-        see `so13.Lorentz_Irreps`
-    path_normalization : {'element', 'path'}
-        see `so13.Lorentz_Irreps`
-    internal_weights : bool
-        see `so13.Lorentz_Irreps`
-    shared_weights : bool
-        see `so13.Lorentz_Irreps`
-    """
-
-    def __init__(self,
-                 irreps_in1,
-                 irreps_in2,
-                 irreps_out,
-                 irrep_normalization: str = None,
-                 path_normalization: str = None,
-                 **kwargs):
-        irreps_in1 = so13.Lorentz_Irreps(irreps_in1)
-        irreps_in2 = so13.Lorentz_Irreps(irreps_in2)
-        irreps_out = so13.Lorentz_Irreps(irreps_out)
-
-        instr = [(i_1, i_2, i_out, 'uvw', True, 1.0)
-                 for i_1, (_, ir_1) in enumerate(irreps_in1)
-                 for i_2, (_, ir_2) in enumerate(irreps_in2)
-                 for i_out, (_, ir_out) in enumerate(irreps_out)
-                 if ir_out in ir_1 * ir_2]
-        super().__init__(irreps_in1,
-                         irreps_in2,
-                         irreps_out,
-                         instr,
-                         irrep_normalization=irrep_normalization,
-                         path_normalization=path_normalization,
-                         **kwargs)
-
-
-class ElementwiseTensorProduct(TensorProduct):
-    r"""Elementwise connected tensor product.
-    .. math::
-        z_u = x_u \otimes y_u
-    where :math:`u` runs over the irreps. Note that there are no weights.
-    The output representation is determined by the two input representations.
-    Parameters
-    ----------
-    irreps_in1 : `so13.Lorentz_Irreps`
-        representation of the first input
-    irreps_in2 : `so13.Lorentz_Irreps`
-        representation of the second input
-    filter_ir_out : iterator of `so13.Lorentz_Irrep`, optional
-        filter to select only specific `so13.Lorentz_Irrep` of the output
-    normalization : {'component', 'norm'}
-        see `so13.TensorProduct`
-    Examples
-    --------
-    Elementwise scalar product
-    """
-
-    def __init__(self, irreps_in1, irreps_in2, filter_ir_out=None, **kwargs):
-
-        irreps_in1 = so13.Lorentz_Irreps(irreps_in1).simplify()
-        irreps_in2 = so13.Lorentz_Irreps(irreps_in2).simplify()
-        if filter_ir_out is not None:
-            filter_ir_out = [so13.Lorentz_Irrep(ir) for ir in filter_ir_out]
-
-        assert irreps_in1.num_irreps == irreps_in2.num_irreps
-
-        irreps_in1 = list(irreps_in1)
-        irreps_in2 = list(irreps_in2)
-
-        i = 0
-        while i < len(irreps_in1):
-            mul_1, ir_1 = irreps_in1[i]
-            mul_2, ir_2 = irreps_in2[i]
-
-            if mul_1 < mul_2:
-                irreps_in2[i] = (mul_1, ir_2)
-                irreps_in2.insert(i + 1, (mul_2 - mul_1, ir_2))
-
-            if mul_2 < mul_1:
-                irreps_in1[i] = (mul_2, ir_1)
-                irreps_in1.insert(i + 1, (mul_1 - mul_2, ir_1))
-            i += 1
-
-        out = []
-        instr = []
-        for i, ((mul, ir_1), (mul_2,
-                              ir_2)) in enumerate(zip(irreps_in1, irreps_in2)):
-            assert mul == mul_2
-            for ir in ir_1 * ir_2:
-
-                if filter_ir_out is not None and ir not in filter_ir_out:
-                    continue
-
-                i_out = len(out)
-                out.append((mul, ir))
-                instr += [(i, i, i_out, 'uuu', False)]
-
-        super().__init__(irreps_in1, irreps_in2, out, instr, **kwargs)

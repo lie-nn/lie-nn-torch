@@ -14,15 +14,14 @@ from e3nn.util.jit import compile_mode
 from opt_einsum import contract
 from LieACE.tools.torch_tools import get_complex_default_dtype
 from lie_nn import reduced_symmetric_tensor_product_basis, ReducedRep
-from lie_nn.irreps import Irreps
-
+import lie_nn as lie
 
 @compile_mode("script")
 class SymmetricContraction(CodeGenMixin, torch.nn.Module):
     def __init__(
         self,
-        irreps_in: Irreps,
-        irreps_out: Irreps,
+        irreps_in: lie.rep,
+        irreps_out: lie.rep,
         correlation: Union[int, Dict[str, int]],
         irrep_normalization: str = "component",
         path_normalization: str = "element",
@@ -42,8 +41,8 @@ class SymmetricContraction(CodeGenMixin, torch.nn.Module):
         assert irrep_normalization in ["component", "norm", "none"]
         assert path_normalization in ["element", "path", "none"]
 
-        self.irreps_in = so13.Lorentz_Irreps(irreps_in)
-        self.irreps_out = so13.Lorentz_Irreps(irreps_out)
+        self.irreps_in = irreps_in
+        self.irreps_out = irreps_out
 
         del irreps_in, irreps_out
 
@@ -88,8 +87,8 @@ class SymmetricContraction(CodeGenMixin, torch.nn.Module):
 class Contraction(torch.nn.Module):
     def __init__(
         self,
-        irreps_in: Irreps,
-        irrep_out: Irreps,
+        irreps_in: lie.rep,
+        irrep_out: lie.rep,
         correlation: int,
         internal_weights: bool = True,
         element_dependent: bool = True,
@@ -100,7 +99,7 @@ class Contraction(torch.nn.Module):
 
         self.element_dependent = element_dependent
         self.num_features = irreps_in.count((0, 0))
-        self.coupling_irreps = Irreps([irrep.ir for irrep in irreps_in])
+        self.coupling_irreps = ReducedRep.from_irreps([irrep.ir for irrep in irreps_in])
         self.correlation = correlation
         irreps_out = ReducedRep.from_string(str(irrep_out), Irreps).irreps
         dtype = torch.get_default_dtype()

@@ -1,5 +1,4 @@
 from typing import List
-from LieCG.so13.utils import normalize2mom
 
 import torch
 """MIT License

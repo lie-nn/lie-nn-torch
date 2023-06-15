@@ -12,21 +12,6 @@ class Extract(CodeGenMixin, torch.nn.Module):
 
     def __init__(self, irreps_in, irreps_outs, instructions, squeeze_out: bool = False):
         r"""Extract sub sets of irreps
-        Parameters
-        ----------
-        irreps_in : `so13.Lorentz_Irreps`
-            representation of the input
-        irreps_outs : list of `so13.Lorentz_Irreps`
-            list of representation of the outputs
-        instructions : list of tuple of int
-            list of tuples, one per output continaing each ``len(irreps_outs[i])`` int
-        squeeze_out : bool, default False
-            if ``squeeze_out`` and only one output exists, a ``torch.Tensor`` will be returned instead of a ``Tuple[torch.Tensor]``
-        Examples
-        --------
-        >>> c = Extract('1e + 0e + 0e', ['0e', '0e'], [(1,), (2,)])
-        >>> c(torch.tensor([0.0, 0.0, 0.0, 1.0, 2.0]))
-        (tensor([1.]), tensor([2.]))
         """
         super().__init__()
         self.irreps_in = so13.Lorentz_Irreps(irreps_in)
