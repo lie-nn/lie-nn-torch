@@ -12,7 +12,6 @@ import torch
 import torch.fx
 from e3nn.util.codegen import CodeGenMixin
 from e3nn.util.jit import compile_mode
-from LieACE.tools.torch_tools import get_complex_default_dtype
 from opt_einsum import contract
 
 
@@ -114,7 +113,7 @@ class Contraction(torch.nn.Module):
                     f"U_matrix_{nu}",
                     torch.moveaxis(
                         torch.tensor(u, dtype=torch.get_default_dtype()), -1, 0
-                    ).to(get_complex_default_dtype()),
+                    ).to(dtype),
                 )
         if element_dependent:
             # Tensor contraction equations
@@ -156,9 +155,9 @@ class Contraction(torch.nn.Module):
             out = contract(
                 self.equation_main,
                 self.U_tensors(self.correlation),
-                self.weights[str(self.correlation)].to(get_complex_default_dtype()),
+                self.weights[str(self.correlation)].to(torch.get_default_dtype()),
                 x,
-                y.to(get_complex_default_dtype()),
+                y.to(torch.get_default_dtype()),
             )  # TODO: use optimize library and cuTENSOR  # pylint: disable=fixme
             for corr in range(self.correlation - 1, 0, -1):
                 c_tensor = contract(
