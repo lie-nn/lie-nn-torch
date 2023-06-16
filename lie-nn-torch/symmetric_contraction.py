@@ -7,14 +7,14 @@
 
 from typing import Dict, Optional, Union
 
+import lie_nn as lie
 import torch
 import torch.fx
 from e3nn.util.codegen import CodeGenMixin
 from e3nn.util.jit import compile_mode
-from opt_einsum import contract
 from LieACE.tools.torch_tools import get_complex_default_dtype
-from lie_nn import reduced_symmetric_tensor_product_basis, ReducedRep
-import lie_nn as lie
+from opt_einsum import contract
+
 
 @compile_mode("script")
 class SymmetricContraction(CodeGenMixin, torch.nn.Module):
@@ -66,10 +66,10 @@ class SymmetricContraction(CodeGenMixin, torch.nn.Module):
         del internal_weights, shared_weights
 
         self.contractions = torch.nn.ModuleDict()
-        for irrep_out in self.irreps_out:
+        for irrep_out in self.irreps_out.irreps:
             self.contractions[str(irrep_out)] = Contraction(
                 irreps_in=self.irreps_in,
-                irrep_out=str(irrep_out.ir),
+                irrep_out=irrep_out,
                 correlation=correlation[irrep_out],
                 internal_weights=self.internal_weights,
                 element_dependent=element_dependent,
@@ -99,18 +99,16 @@ class Contraction(torch.nn.Module):
 
         self.element_dependent = element_dependent
         self.num_features = irreps_in.count((0, 0))
-        self.coupling_irreps = ReducedRep.from_irreps([irrep.ir for irrep in irreps_in])
         self.correlation = correlation
-        irreps_out = ReducedRep.from_string(str(irrep_out), Irreps).irreps
         dtype = torch.get_default_dtype()
         for nu in range(1, correlation + 1):
-            U = reduced_symmetric_tensor_product_basis(
-                ReducedRep.from_string(str(self.coupling_irreps), Irreps), nu,
+            U = lie.reduced_symmetric_tensor_product_basis(
+                irreps_in, nu,
             )
             irreps = U.rep.irreps
             for (mul_ir_out), u in zip(irreps, U.list):
                 ir_out = mul_ir_out.rep
-                if ir_out not in map(lambda x: x.rep, irreps_out):
+                if ir_out not in map(lambda x: x.rep, irrep_out):
                     continue
                 self.register_buffer(
                     f"U_matrix_{nu}",
